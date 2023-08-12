@@ -13,6 +13,6 @@
    ```
 
 
-4. 下载OFA-large，重命名为pytorch_model.bin，放于OFA-large/目录下
+4. 下载OFA-large(https://huggingface.co/OFA-Sys/ofa-large)，重命名为pytorch_model.bin，放于OFA-large/目录下
 5. 下载数据集，放在data/目录下
 6. 配置环境
