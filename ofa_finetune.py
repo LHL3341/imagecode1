@@ -1,7 +1,7 @@
 # inspired from: https://github.com/openai/CLIP/issues/83
 # https://github.com/openai/CLIP/issues/83
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+#os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 
 import json
 import os
@@ -26,8 +26,8 @@ from OFA.transformers.src.transformers.models.ofa.tokenization_ofa import OFATok
 from OFA.transformers.src.transformers.models.ofa.modeling_ofa import OFAModel
 
 
-from image_decoder import ImageDecoder,mask_image,compute_img_loss,to_patches
-from text_decoder import TextDecoder,mask_token,compute_txt_loss
+from image_decoder import ImageDecoder,mask_image
+from text_decoder import TextDecoder,mask_token
 
 
 random.seed(10)
@@ -69,6 +69,8 @@ class ContextualCLIP(torch.nn.Module):
         self.OFA_encoder = OFAModel.from_pretrained('OFA-large')
         self.OFA_encoder.decoder = None
 
+        self.img_decoder = ImageDecoder() # TODO 图像解码器，参考MAE
+        self.txt_decoder = TextDecoder() # TODO 文本解码器，参考BERT
 
         config = BertConfig.from_dict(bert_config)
         self.fusion = args.fusion
@@ -77,8 +79,6 @@ class ContextualCLIP(torch.nn.Module):
         config.num_attention_heads = 8
         self.transformer = nn.ModuleList([BertLayer(config) for _ in range(args.transformer_layers)])
         self.transformer.cuda()
-        self.img_decoder = ImageDecoder(config)
-        self.txt_decoder = TextDecoder(config)
         self.prediction_layer = nn.Linear(config.hidden_size, 1).cuda()
         self.batch_size = 1
         self.logit_scale = float(args.logit_scale)
@@ -126,62 +126,15 @@ class ContextualCLIP(torch.nn.Module):
         cls_tokens = all_hidden_states[:, 256]   # 10*1024
         text_tokens = all_hidden_states[:,257:]  # 10*text_len-1*1024
 
-        x_ = torch.unsqueeze(cls_tokens,dim=0)
-        if self.positional:
-            embs = self.positional_emb(torch.arange(10).cuda())
-            embs = embs * pos_mask
-            x_pos = x_ + embs
-        else:
-            x_pos = x_
-        attention_mask = torch.ones((self.batch_size,1,1,10)).cuda()
-        x = self.transformer[0](x_pos, attention_mask)
-        for layer_module in self.transformer[1:]:
-            x = layer_module(x, attention_mask)
-        if self.add_input:
-            x = x + x_
+        x = torch.unsqueeze(cls_tokens,dim=0)
 
         preds = self.prediction_layer(x.half())
 
-        img_recon_loss = 0
-        txt_recon_loss = 0
-        retrieval_loss = 0
+        ground_truth = torch.tensor([img_idx]).long().cuda()
+        retrieval_loss = self.rloss(preds, ground_truth.unsqueeze(dim=0))
 
-        if self.training:
-
-            ground_truth = torch.tensor([img_idx]).long().cuda()
-            retrieval_loss = self.rloss(preds, ground_truth.unsqueeze(dim=0))
-
-            mask_img = True
-            mask_txt = True
-            use_gradcam = False
-
-            if output_attn:
-                attn_grad = torch.autograd.grad(outputs=retrieval_loss, inputs=attn_map,retain_graph=True)
-                attn_grad,attn_map = attn_grad[0].mean(dim=1),attn_map.mean(dim=1)
-                print(attn_grad.norm(),attn_map.norm())
-                attn_grad,attn_map = attn_grad[img_idx,256:-1,:256].reshape(-1,256),attn_map[img_idx,256:-1,:256].reshape(-1,256)
-                attn_grad /= attn_grad.norm()
-                attn_map /= attn_map.norm()
-                print(attn_grad.norm(),attn_map.norm())
-                grad_cam = attn_map*attn_grad
-
-            # x为十对图文的[cls]，b*10*1024(c_h)
-            if mask_img: 
-                image_patches = to_patches(images[img_idx])
-                mask = mask_image(image_tokens[img_idx])
-                recon_pixels = self.img_decoder(image_tokens[img_idx],x[0,img_idx],mask)
-                mask_id = torch.where(mask==0)[1]
-                img_recon_loss = compute_img_loss(recon_pixels,image_patches[mask_id])
-                
-            if mask_txt: 
-                mask = mask_token(text_tokens[img_idx])
-                logits = self.txt_decoder(text_tokens[img_idx],x[0,img_idx],mask)
-                txt_recon_loss = compute_txt_loss(logits,input_ids,mask)
         
-        loss = img_recon_loss + txt_recon_loss + retrieval_loss
-
-        if output_attn:
-            return preds, loss, grad_cam,gen.attentions, gen.hidden_states 
+        loss = retrieval_loss
         return preds, loss
 
     def encode_images(self, photos_batch):
@@ -199,19 +152,19 @@ class ContextualCLIP(torch.nn.Module):
             text_encoded /= text_encoded.norm(dim=-1, keepdim=True)
         return text_encoded.cpu().numpy()
 if __name__ == "__main__":
-    wandb.init(project='mim_mlm', settings=wandb.Settings(start_method="fork"))
+    wandb.init(project='contextualofa_finetune', settings=wandb.Settings(start_method="fork"))
     config = wandb.config
     parser = argparse.ArgumentParser()
     parser.add_argument("-b", "--batchsize", type=int, default=36)
-    parser.add_argument("--lr_head", type=float, default=1e-5)
-    #parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--wd", default= 1., type=float)
+    parser.add_argument("--lr_head", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--wd", default= 0.01, type=float)
     parser.add_argument("-m", "--model", type=str, default='ViT-B/16')
     parser.add_argument("--fusion", type=str,default='mult')
     parser.add_argument("-a", "--activation", default='relu')
     parser.add_argument("-s", "--logit_scale", default=1000)
-    parser.add_argument("--frozen_clip", action="store_true",default=True)
-    parser.add_argument("--finetuned_checkpoint_path", default='checkpoints/ofa_finetune_full/CONTEXTUAL_clip_best_0.20833333333333334__36_0.0001_1e-05_0.01_ViT-B16_mult_relu_1000_False_True_True_0.95_0.95_2_False_30.pt')
+    parser.add_argument("--frozen_clip", action="store_true",default=False)
+    parser.add_argument("--finetuned_checkpoint_path", default='')
     parser.add_argument("--add_input", action="store_true",default=True)
     parser.add_argument("--positional", action="store_true",default=True)
     parser.add_argument("--head_scheduler", default= 0.95, type=float)#0.95
@@ -220,7 +173,7 @@ if __name__ == "__main__":
     parser.add_argument("--all_pos", action="store_true",default=False)
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--valid_descr_path', type=str, default='data/valid_data.json')
-    parser.add_argument('--train_descr_path', type=str, default='data/train_data_partial.json')
+    parser.add_argument('--train_descr_path', type=str, default='data/train_data.json')
     parser.add_argument('--imgs_path', type=str, default='data/image-sets')
 
     args = parser.parse_args()
@@ -250,7 +203,7 @@ if __name__ == "__main__":
     if args.finetuned_checkpoint_path:
         print("loading checkpoint")
         checkpoint = torch.load(args.finetuned_checkpoint_path)
-        contextual_clip.load_state_dict(checkpoint['model_state_dict'],strict=False)
+        contextual_clip.load_state_dict(checkpoint['model_state_dict'])
         print("checkpoint loaded")
     contextual_clip.cuda()
     config = wandb.config
@@ -270,19 +223,13 @@ if __name__ == "__main__":
         else:
             p.requires_grad = True
 
+    head_params = list(contextual_clip.prediction_layer.parameters())
 
-    head_params = list(contextual_clip.transformer.parameters())\
-    + list(contextual_clip.prediction_layer.parameters())\
-    + list(contextual_clip.img_decoder.parameters())\
-    + list(contextual_clip.txt_decoder.parameters())\
-
-    if args.positional:
-        head_params += list(contextual_clip.positional_emb.parameters())
-    optimizer = optim.Adam([{"params": head_params}] , lr=config.lr_head, betas=(0.9, 0.98), eps=1e-6, weight_decay=config.wd)
+    optimizer = optim.Adam([{"params": contextual_clip.OFA_encoder.parameters()}, {"params": head_params, "lr": config.lr_head}] , lr=config.lr, betas=(0.9, 0.98), eps=1e-6, weight_decay=config.wd)
 
     lambda1 = lambda epoch: args.base_scheduler ** epoch
-    #lambda2 = lambda epoch: args.head_scheduler ** epoch
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=[lambda1])
+    lambda2 = lambda epoch: args.head_scheduler ** epoch
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=[lambda1, lambda2])
     best_val = 0
 
     for i in range(args.epochs):
@@ -336,7 +283,7 @@ if __name__ == "__main__":
                     'epoch': i,
                     'model_state_dict': contextual_clip.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
-                }, f"checkpoints/ofa/CONTEXTUAL_clip_best_{best_val}_{string.replace('/', '')}.pt")
+                }, f"checkpoints/ofa_finetune_full/CONTEXTUAL_clip_best_{best_val}_{string.replace('/', '')}.pt")
             print('------------------------------')
 
         print(f'EPOCH: {i}')
@@ -365,6 +312,9 @@ if __name__ == "__main__":
             if args.all_pos:
                 pos_mask = torch.ones((10,1)).cuda()
             logits,loss = contextual_clip(images, input_ids, pos_mask, img_idx)
+            ground_truth = torch.tensor([img_idx]).long().to(device)  # the index of the correct one
+            loss_txt = nn.CrossEntropyLoss()
+            loss = loss_txt(logits, ground_truth.unsqueeze(dim=0))
             loss.backward()
             pred = torch.argmax(logits).squeeze()
             if img_idx == pred:
